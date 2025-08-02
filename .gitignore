@@ -1,0 +1,6 @@
+zusi_config.json
+venv
+*.bin
+*.pt
+model_encoded.txt
+data/*
