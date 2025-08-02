@@ -17,7 +17,10 @@ pip install -r requirements.txt
 ## Required files
 
 ```
-https://huggingface.co/Kleinhe/CAMD/resolve/main/weights/ViT-B-32.pt > clip_model/ViT-B-32.pt
+https://huggingface.co/Kleinhe/CAMD/blob/main/weights/ViT-B-32.pt > clip_model/ViT-B-32.pt
+
+https://drive.google.com/file/d/19YomucrGCrv96fF5nxcMhvrygNjU1o36/view?usp=sharing > all the following files:
+
 clip_patch/open_clip_pytorch_model.bin
 clip_patch/model_encoded.txt
 data/Bilder
