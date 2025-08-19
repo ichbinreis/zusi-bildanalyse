@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-# Bildvergleich GUI mit Verzeichniswahl, Fortschrittsanzeige, ETA und Fehlerbehandlung
-
 import os
 import shutil
 import pandas as pd
@@ -21,226 +19,463 @@ from tkinter import filedialog, messagebox
 import sys
 
 if getattr(sys, 'frozen', False):
-    SCRIPT_DIR = sys._MEIPASS
+    SCRIPT_DIR = sys._MEIPASS  # type: ignore
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DATEN_DIR = os.path.join(SCRIPT_DIR, "data")
+DATEN_DIR = os.path.join(SCRIPT_DIR, "Daten")
 CSV_PFAD = os.path.join(DATEN_DIR, "Objektdatenbank.csv")
 BILDER_DIR = os.path.join(DATEN_DIR, "Bilder")
-AUSGABE_DIR = os.path.join(DATEN_DIR, "ausgabe_bilder")
-EMBEDDINGS_PATH = os.path.join(DATEN_DIR, "alle_bilder_embeddings.npy")
-INDEX_PATH = os.path.join(DATEN_DIR, "alle_bilder_index.csv")
-CONFIG_PATH = os.path.join(DATEN_DIR, "zusi_config.json")
+AUSGABE_DIR = os.path.join(SCRIPT_DIR, "ausgabe_bilder")
+EMBEDDINGS_PATH = os.path.join(SCRIPT_DIR, "alle_bilder_embeddings.npy")
+INDEX_PATH = os.path.join(SCRIPT_DIR, "alle_bilder_index.csv")
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "zusi_config.json")
 
-TOP_N_IMAGE = 50
+TOP_N_IMAGE = 50  # endgültige Top-Kandidaten, die im HTML landen
+VORFILTER_TOP_N = 200  # Standard-Modus: so viele Kandidaten kommen durch den Vorfilter
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# CLIP
 model_path = os.path.join(SCRIPT_DIR, "clip_patch", "open_clip_pytorch_model.bin")
-model, _, image_preprocess = open_clip.create_model_and_transforms(
-    "ViT-B-32",
-    pretrained=model_path
-)
+model, _, image_preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained=model_path)
 model.to(device)
 model.eval()
 
-def embed_image(pfad):
+
+def lade_bild(pfad):
     try:
-        image = image_preprocess(Image.open(pfad).convert("RGB")).unsqueeze(0).to(device)
-        with torch.no_grad():
-            return model.encode_image(image).cpu().numpy()
-    except Exception as e:
-        print(f"[WARN] Bild konnte nicht verarbeitet werden: {pfad} — {e}")
+        img = Image.open(pfad).convert("RGB")
+        return image_preprocess(img).unsqueeze(0).to(device)
+    except Exception:
         return None
+
+
+def bilde_embedding(img_tensor):
+    with torch.no_grad():
+        emb = model.encode_image(img_tensor)
+        emb = emb / emb.norm(dim=-1, keepdim=True)
+        return emb.cpu().numpy()
+
 
 def zusi_verzeichnis_laden():
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             return json.load(f).get("zusi_verzeichnis", "")
-    return "C:/Program Files/Zusi3/_ZusiData"
+    return ""
+
 
 def zusi_verzeichnis_speichern(pfad):
-    with open(CONFIG_PATH, 'w') as f:
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump({"zusi_verzeichnis": pfad}, f)
 
-# Fortschritt & ETA live anzeigen
-ergebnisse_counter = 0
-gesamt_ergebnisse = 1
+def resolve_verzeichnis_path(verzeichnis, zusi_pfad):
+    v = str(verzeichnis).strip()
+    if not v or v == "NICHT GEFUNDEN":
+        return ""
+    v = v.replace("/", "\\")
+    # absoluter Pfad?
+    if os.path.isabs(v):
+        lower = v.lower()
+        marker = "_zusidata"
+        i = lower.find(marker)
+        if i != -1:
+            rel = v[i + len(marker):].lstrip("\\/")
+            return os.path.join(zusi_pfad, rel)
+        return v
+    # relativer Pfad
+    return os.path.join(zusi_pfad, v.lstrip("\\/"))
+
+
+
+
+# Fortschritt & ETA
+ergebnisse_counter = 0           # Fertige Eingabebilder
+gesamt_ergebnisse = 1            # Anzahl Eingabebilder
 start_zeit = time.time()
+current_image_start = time.time()
+durations = []                   # Dauer je fertigem Eingabebild (Sekunden)
+
+total_images = 1
+
+
+def format_sec(s):
+    s = int(max(0, s))
+    m, sec = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {sec}s"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
 
 def fortschritt_thread():
+    global durations, current_image_start, total_images
     while ergebnisse_counter < gesamt_ergebnisse:
         time.sleep(1)
-        if ergebnisse_counter == 0:
-            eta_text_var.set("ETA: wird berechnet ...")
-            continue
-        vergangen = time.time() - start_zeit
-        rest = gesamt_ergebnisse - ergebnisse_counter
-        eta = int((vergangen / ergebnisse_counter) * rest)
-        fortschritt.set(int(ergebnisse_counter / gesamt_ergebnisse * 100))
-        eta_text_var.set(f"ETA: {eta} Sekunden verbleibend")
+        done = ergebnisse_counter
+        total = max(1, gesamt_ergebnisse)
+        # Fortschritt in % (fertige Bilder / Gesamt)
+        fortschritt.set(int(done / total * 100))
+
+        elapsed_curr = time.time() - current_image_start
+
+        # Per-Image ETA
+        if len(durations) == 0:
+            # Erste Schätzung: aktuelles Bild total = elapsed * 2 (Heuristik), min 10s
+            est_per_image = max(10, elapsed_curr * 2)
+            eta_curr = int(max(0, est_per_image - elapsed_curr))
+            # Gesamt-ETA = Rest dieses Bildes + Restbilder * est_per_image
+            remaining_images_after_current = max(0, total_images - done - 1)
+            eta_total = int(eta_curr + remaining_images_after_current * est_per_image)
+        else:
+            avg = sum(durations) / len(durations)
+            eta_curr = int(max(0, avg - elapsed_curr))
+            remaining_images_after_current = max(0, total_images - done - 1)
+            eta_total = int(eta_curr + remaining_images_after_current * avg)
+
+        eta_text_var.set(f"ETA gesamt: {format_sec(eta_total)} | aktuelles Bild: {format_sec(eta_curr)}")
         root.update_idletasks()
 
-def analyse_ausfuehren():
-    modus = modus_var.get()
-    if modus not in ["fast", "medium", "strong"]:
-        messagebox.showerror("Fehler", "Bitte einen Modus auswählen.")
-        return
 
-    zusi_pfad = zusi_pfad_var.get().strip()
-    if not zusi_pfad or not os.path.exists(zusi_pfad):
-        messagebox.showerror("Fehler", "Bitte ein gültiges Zusi-Stammverzeichnis auswählen.")
-        return
-
-    zusi_verzeichnis_speichern(zusi_pfad)
-
-    eingabepfade = filedialog.askopenfilenames(title="Eingabebilder wählen", filetypes=[["Bilder", "*.jpg *.jpeg *.png"]])
-    if not eingabepfade:
-        return
-
-    df_meta = pd.read_csv(CSV_PFAD, encoding="utf-8")
-    df_meta = df_meta[df_meta['jpg_dateiname'].notna()]
-    df_meta.set_index("jpg_dateiname", inplace=True)
-    alle_bilder = df_meta.index.tolist()
-
-    if modus == "fast":
-        if not os.path.exists(EMBEDDINGS_PATH) or not os.path.exists(INDEX_PATH):
-            messagebox.showerror("Fehler", "Fast-Modus benötigt vorberechnete Embeddings.")
-            return
-        alle_vecs = np.load(EMBEDDINGS_PATH)
-        index_df = pd.read_csv(INDEX_PATH)
-        vorfilter_top_n = 200
-    elif modus == "medium":
-        if not os.path.exists(EMBEDDINGS_PATH) or not os.path.exists(INDEX_PATH):
-            messagebox.showerror("Fehler", "Medium-Modus benötigt vorberechnete Embeddings.")
-            return
-        alle_vecs = np.load(EMBEDDINGS_PATH)
-        index_df = pd.read_csv(INDEX_PATH)
-        vorfilter_top_n = 1000
-    else:
-        kandidaten = alle_bilder
-
-    if not os.path.exists(AUSGABE_DIR):
-        os.makedirs(AUSGABE_DIR)
-
-    global ergebnisse_counter, gesamt_ergebnisse, start_zeit
-    ergebnisse_counter = 0
-    gesamt_ergebnisse = len(eingabepfade) * TOP_N_IMAGE
-    start_zeit = time.time()
-    threading.Thread(target=fortschritt_thread, daemon=True).start()
-
-    for idx, eingabe_pfad in enumerate(eingabepfade, start=1):
-        eingabe_datei = os.path.basename(eingabe_pfad)
-        ordnername = os.path.splitext(eingabe_datei)[0]
-        ausgabe_pfad = os.path.join(AUSGABE_DIR, ordnername)
-
-        eingabe_vec = embed_image(eingabe_pfad)
-        if eingabe_vec is None:
-            continue
-
-        os.makedirs(ausgabe_pfad, exist_ok=True)
-        shutil.copy2(eingabe_pfad, os.path.join(ausgabe_pfad, eingabe_datei))
-
-        if modus in ["fast", "medium"]:
-            scores = cosine_similarity([eingabe_vec[0]], alle_vecs)[0]
-            top_idx = np.argsort(scores)[::-1][:vorfilter_top_n]
-            kandidaten = index_df.iloc[top_idx]["bildname"].tolist()
-
-        ergebnisse = []
-        for kandidat in kandidaten:
-            pfad = os.path.join(BILDER_DIR, kandidat)
-            vec = embed_image(pfad)
-            if vec is None:
-                continue
-            score = cosine_similarity(eingabe_vec, vec)[0][0]
-            row = df_meta.loc[kandidat] if kandidat in df_meta.index else {}
-            name = row.get("Tatsächlicher Name", "-")
-            link = str(row.get("Link", "-")).strip()
-            verzeichnis = str(row.get("Verzeichnis", "")).strip()
-            vermutung = str(row.get("K", "")).strip()
-            ergebnisse.append((score, kandidat, name, link, verzeichnis, vermutung))
-            ergebnisse_counter += 1
-
-        ergebnisse.sort(key=lambda x: x[0], reverse=True)
-        top = ergebnisse[:TOP_N_IMAGE]
-
-        html_path = os.path.join(ausgabe_pfad, "ergebnisse.html")
-        os.makedirs(ausgabe_pfad, exist_ok=True)
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(f"""<html><head><meta charset='utf-8'>
-<title>Bildvergleich Ergebnisse</title>
-<style>
-body {{ font-family: sans-serif; padding: 20px; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }}
-.item {{ border: 1px solid #ccc; padding: 10px; border-radius: 8px; background: #f9f9f9; }}
-img.thumb {{ width: 100%; height: auto; border-radius: 4px; }}
-img.header {{ max-width: 100%; max-height: 400px; display: block; margin: 0 auto; }}
-</style></head><body>
-<h2>Top {TOP_N_IMAGE} ähnlichste Bilder zu: {eingabe_datei}</h2>
-<img src='{eingabe_datei}' class='header'><br><br><hr>
-<div class='grid'>""")
-            for score, bildname, name, link, verzeichnis, vermutung in top:
-                zielbild = os.path.join(ausgabe_pfad, bildname)
-                shutil.copy2(os.path.join(BILDER_DIR, bildname), zielbild)
-                link_html = f"<a href='{link}' target='_blank'>Link</a><br>" if link and link != "-" else ""
-                info = " <span title='ggf. falsches Verzeichnis – Dateiname weicht ab'>ℹ️</span>" if vermutung.lower() == "vermutung" else ""
-                if verzeichnis and verzeichnis != "NICHT GEFUNDEN":
-                    verzeichnis_pfad = os.path.join(zusi_pfad, verzeichnis.strip("/\\"))
-                    verzeichnis_url = 'file:///' + verzeichnis_pfad.replace("\\", "/").replace(" ", "%20")
-                    link_objekt = (
-                        f"<a href='{verzeichnis_url}' target='_blank'>Zum Objektordner</a>{info}<br>"
-                        f"<a href='#' onclick=\"navigator.clipboard.writeText('{verzeichnis_pfad.replace('\\', '/')}'); return false;\">📋 Pfad kopieren</a><br>"
-                    )
-                    anzeige_verzeichnis = verzeichnis_pfad.replace("/", "\\")
-                    anzeige_verzeichnis_html = f"<div style='font-size:10px; color:#555; word-break:break-all;'>{anzeige_verzeichnis}</div>"
-
-                else:
-                    link_objekt = f"<span title='Dieses Objekt scheint nicht im offiziellen Bestand zu liegen' style='color:gray'>Kein Objektordner</span>{info}<br>"
-                    anzeige_verzeichnis_html = ""
-                f.write(f"<div class='item'><b>Score: {score:.2f}</b><br>{name}<br>{link_html}{link_objekt}{anzeige_verzeichnis_html}<img src='{bildname}' class='thumb'></div>")
-            f.write("</div></body></html>")
-
-        if ergebnis_oeffnen_var.get():
-            webbrowser.open(f"file:///{html_path}")
-
-        if ordner_oeffnen_var.get():
-            subprocess.Popen(["explorer", os.path.realpath(ausgabe_pfad)])
-
-        progress_text_var.set(f"Analysiere {eingabe_datei} ({idx}/{len(eingabepfade)})...")
-
-    fortschritt.set(100)
-    eta_text_var.set("Fertig!")
-    progress_text_var.set(f"✅ Analyse abgeschlossen ({len(eingabepfade)} Bild(er))")
-
-# GUI Setup
+# GUI
 root = tk.Tk()
 root.title("Zusi Bildvergleich")
-root.geometry("480x360")
 root.resizable(False, False)
 
-modus_var = tk.StringVar(value="fast")
+eingabe_pfade = []
+
+# Nur noch zwei Modi: Standard (ehemals fast) und Strong
+modus_var = tk.StringVar(value="standard")  # standard, strong
 zusi_pfad_var = tk.StringVar(value=zusi_verzeichnis_laden())
-progress_text_var = tk.StringVar()
-eta_text_var = tk.StringVar()
-fortschritt = tk.IntVar()
 ergebnis_oeffnen_var = tk.BooleanVar(value=True)
 ordner_oeffnen_var = tk.BooleanVar(value=False)
 
-tk.Label(root, text="Verarbeitungsmodus wählen:").pack()
-for m in [("Fast (~15s)", "fast"), ("Medium (~1min)", "medium"), ("Strong (~5min)", "strong")]:
-    tk.Radiobutton(root, text=m[0], variable=modus_var, value=m[1]).pack()
+progress_text_var = tk.StringVar(value="Bereit")
+eta_text_var = tk.StringVar(value="")
+fortschritt = tk.IntVar(value=0)
 
-tk.Label(root, text="Zusi-Stammdatenverzeichnis (Ordner _ZusiData wählen):").pack()
-tk.Entry(root, textvariable=zusi_pfad_var, width=60).pack()
-tk.Button(root, text="Pfad auswählen", command=lambda: zusi_pfad_var.set(filedialog.askdirectory())).pack()
 
-tk.Checkbutton(root, text="Ergebnis sofort öffnen", variable=ergebnis_oeffnen_var).pack()
-tk.Checkbutton(root, text="Verzeichnis sofort öffnen", variable=ordner_oeffnen_var).pack()
-tk.Button(root, text="Bilder auswählen und Analyse starten", command=lambda: threading.Thread(target=analyse_ausfuehren).start()).pack()
+def bilder_auswaehlen():
+    files = filedialog.askopenfilenames(
+        title="Bilder auswählen",
+        filetypes=[("Bilder", "*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff")]
+    )
+    if files:
+        eingabe_pfade.clear()
+        eingabe_pfade.extend(files)
+        progress_text_var.set(f"{len(eingabe_pfade)} Bild(er) ausgewählt")
+        root.update_idletasks()
 
-tk.Label(root, textvariable=progress_text_var).pack()
-tk.Label(root, textvariable=eta_text_var).pack()
-ttk.Progressbar(root, maximum=100, variable=fortschritt, length=300, mode="determinate").pack()
+
+def analyse_ausfuehren():
+    global ergebnisse_counter, gesamt_ergebnisse, start_zeit, current_image_start, durations, total_images
+
+    if not eingabe_pfade:
+        messagebox.showwarning("Hinweis", "Keine Eingabebilder ausgewählt.")
+        return
+
+    modus = modus_var.get()
+    zusi_pfad = zusi_pfad_var.get().strip()
+    if not zusi_pfad:
+        messagebox.showwarning("Hinweis", "Bitte Zusi-Stammdatenverzeichnis wählen.")
+        return
+    zusi_verzeichnis_speichern(zusi_pfad)
+
+    # CSV laden – Auto-Delimiter (Komma üblich)
+    if not os.path.exists(CSV_PFAD):
+        messagebox.showerror("Fehler", f"CSV nicht gefunden: {CSV_PFAD}")
+        return
+    try:
+        df = pd.read_csv(CSV_PFAD, sep=",", encoding="utf-8", dtype=str).fillna("")
+    except Exception:
+        df = pd.read_csv(CSV_PFAD, sep=",", encoding="latin1", dtype=str).fillna("")
+
+    # Spalten-Mapping auf deine CSV
+    need = ["jpg_dateiname", "Beschreibung", "Tatsächlicher Name", "Link", "Verzeichnis", "Vermutung"]  # "ungeeignet" optional
+    for c in ["jpg_dateiname", "Link", "Verzeichnis", "Vermutung"]:
+        if c not in df.columns:
+            messagebox.showerror("Fehler", f"Spalte fehlt in CSV: {c}")
+            return
+
+    # Name-Feld wählen (Tatsächlicher Name bevorzugt, sonst Beschreibung)
+    name_col = "Tatsächlicher Name" if "Tatsächlicher Name" in df.columns else ("Beschreibung" if "Beschreibung" in df.columns else None)
+    if name_col is None:
+        messagebox.showerror("Fehler", "Spalte fehlt in CSV: 'Tatsächlicher Name' oder 'Beschreibung'")
+        return
+
+    # Index vorbereiten
+    alle_bilder = []
+    bildname2info = {}
+    for _, row in df.iterrows():
+        bild = row.get("jpg_dateiname", "").strip()
+        if not bild:
+            continue
+        alle_bilder.append(bild)
+        bildname2info[bild] = {
+            "name": row.get(name_col, "").strip(),
+            "link": row.get("Link", "").strip(),
+            "verzeichnis": row.get("Verzeichnis", "").strip(),
+            "vermutung": str(row.get("Vermutung", "")).strip(),
+            "ungeeignet": str(row.get("ungeeignet", "")).strip(),
+        }
+
+    if not alle_bilder:
+        messagebox.showerror("Fehler", "Keine Einträge in der CSV.")
+        return
+
+    # Vorfilter vorbereiten (nur Standard-Modus)
+    if modus == "standard":
+        if not os.path.exists(EMBEDDINGS_PATH) or not os.path.exists(INDEX_PATH):
+            messagebox.showerror("Fehler", "Standard-Modus benötigt vorberechnete Embeddings.")
+            return
+        alle_vecs = np.load(EMBEDDINGS_PATH)
+        index_df = pd.read_csv(INDEX_PATH)
+        if "Bildname" in index_df.columns:
+            idx_col = "Bildname"
+        elif "jpg_dateiname" in index_df.columns:
+            idx_col = "jpg_dateiname"
+        else:
+            # Fallback: erste Spalte als Name verwenden
+            idx_col = index_df.columns[0]
+        bild2row = {str(bn): i for i, bn in enumerate(index_df[idx_col].astype(str).tolist())}
+    else:
+        alle_vecs = None
+        bild2row = None
+
+    # Ausgabeordner
+    os.makedirs(AUSGABE_DIR, exist_ok=True)
+
+    # Fortschritt pro Eingabebild
+    ergebnisse_counter = 0
+    gesamt_ergebnisse = len(eingabe_pfade)
+    total_images = gesamt_ergebnisse
+    durations = []
+    start_zeit = time.time()
+    threading.Thread(target=fortschritt_thread, daemon=True).start()
+
+    for idx, eingabe_pfad in enumerate(eingabe_pfade, start=1):
+        current_image_start = time.time()
+        eingabe_datei = os.path.basename(eingabe_pfad)
+        progress_text_var.set(f"Analysiere {eingabe_datei} ({idx}/{len(eingabe_pfade)})...")
+        root.update_idletasks()
+
+        img_t = lade_bild(eingabe_pfad)
+        if img_t is None:
+            messagebox.showwarning("Warnung", f"Konnte Bild nicht laden: {eingabe_pfad}")
+            durations.append(time.time() - current_image_start)
+            ergebnisse_counter += 1
+            continue
+        q = bilde_embedding(img_t)
+
+        # Kandidatenliste ermitteln
+        if modus == "standard":
+            # Index-Zuordnung
+            vec_index = [bild2row.get(str(b), None) for b in alle_bilder]
+            ok_mask = [i for i, v in enumerate(vec_index) if v is not None]
+            if not ok_mask:
+                messagebox.showerror("Fehler", "Index stimmt nicht mit CSV überein.")
+                return
+            cand_vecs = alle_vecs[[vec_index[i] for i in ok_mask]]
+            sims = cosine_similarity(q, cand_vecs)[0]
+            top_idx = np.argsort(-sims)[:VORFILTER_TOP_N]
+            kandidaten = [alle_bilder[ok_mask[i]] for i in top_idx]
+        else:  # strong
+            kandidaten = alle_bilder
+
+        # Feinauswahl: TOP_N_IMAGE
+        cand_paths = [os.path.join(BILDER_DIR, k) for k in kandidaten]
+        cand_tensors = []
+        cand_names_ok = []
+        for pth in cand_paths:
+            t = lade_bild(pth)
+            if t is None:
+                continue
+            cand_tensors.append(t)
+            cand_names_ok.append(os.path.basename(pth))
+        if not cand_tensors:
+            durations.append(time.time() - current_image_start)
+            ergebnisse_counter += 1
+            continue
+
+        cand_batch = torch.cat(cand_tensors, dim=0)
+        with torch.no_grad():
+            emb_cand = model.encode_image(cand_batch.to(device))
+            emb_cand = emb_cand / emb_cand.norm(dim=-1, keepdim=True)
+            emb_cand = emb_cand.cpu().numpy()
+        sims2 = cosine_similarity(q, emb_cand)[0]
+
+        top_idx2 = np.argsort(-sims2)[:TOP_N_IMAGE]
+        top = []
+        for i in top_idx2:
+            bname = cand_names_ok[i]
+            info = bildname2info.get(bname, {})
+            top.append((float(sims2[i]), bname, info.get("name", ""), info.get("link", ""),
+                        info.get("verzeichnis", ""), info.get("vermutung", ""), info.get("ungeeignet", "")))
+
+        # Ausgabeordner
+        basisname = os.path.splitext(os.path.basename(eingabe_pfad))[0]
+        ausgabe_pfad = os.path.join(AUSGABE_DIR, basisname)
+        os.makedirs(ausgabe_pfad, exist_ok=True)
+
+        # HTML schreiben
+        # Eingabebild in Ausgabeordner kopieren
+        try:
+            shutil.copy2(eingabe_pfad, os.path.join(ausgabe_pfad, os.path.basename(eingabe_pfad)))
+        except Exception:
+            pass
+        html_path = os.path.join(ausgabe_pfad, "index.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write("""<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<title>Ergebnis</title>
+<style>
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.item { border: 1px solid #ddd; border-radius: 8px; padding: 10px; }
+.thumb { width: 100%; height: auto; border-radius: 6px; }
+.meta { font-size: 12px; color: #333; }
+
+.warn-flag { position: relative; cursor: help; display: inline-block; }
+.warn-flag .tooltip {
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.2s;
+  position: absolute;
+  bottom: 125%;
+  left: 0;
+  max-width: 320px;
+  background: #fffbea;
+  color: #222;
+  border: 1px solid #f2d024;
+  border-radius: 6px;
+  padding: 8px 10px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.15);
+  z-index: 10;
+}
+.warn-flag:hover .tooltip { visibility: visible; opacity: 1; }
+.warn-flag .tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 12px;
+  border-width: 6px;
+  border-style: solid;
+  border-color: #f2d024 transparent transparent transparent;
+}
+
+</style></head><body>
+<h2>Eingabebild</h2>""" + f'<img src="{os.path.basename(eingabe_pfad)}" style="max-width:100%;height:auto;margin-bottom:20px">' + """<h2>Ähnlichste Bilder zu """ + basisname + """</h2>
+<div class='grid'>""")
+            for score, bildname, name, link, verzeichnis, vermutung, ungeeignet_val in top:
+                # Warnhinweis je Objekt
+                warn_html_parts = []
+                if str(vermutung).strip().lower() == "vermutung":
+                    tooltip_text = (
+                        f'Hintergrund: Dieses Objekt heißt "{bildname}" auf der Objektdatenbank. '
+                        'Der Pfad und/oder der Name des Zusi-Objekts im offiziellen Bestand ist nicht exakt der gleiche. '
+                        'Mit einer Ähnlichkeitssuche wurde dieses und weitere Objekte automatisch zugeordnet. '
+                        'Das kann bei manchen Objekten falsch sein.'
+                    )
+                    warn_html_parts.append(
+                        "<span class='warn-flag'>⚠️"
+                        f"<span class='tooltip'>{tooltip_text}</span>"
+                        "</span> "
+                        "<span style='color:#b00020;font-weight:600;'>Hinweis: Die Daten zu diesem Objekt sind womöglich nicht korrekt (Dateiname und Verzeichnis können abweichen).</span>"
+                    )
+                if str(ungeeignet_val).strip().lower() == "ungeeignet":
+                    warn_html_parts.append(
+                        "<div style='color:#b00020;font-weight:600;margin-top:4px'>⚠️ Hinweis: Dieses Objekt ist vermutlich ungeeignet für den Geländeformer.</div>"
+                    )
+                warn_html = "".join(warn_html_parts)
+
+                src_img = os.path.join(BILDER_DIR, bildname)
+                dst_img = os.path.join(ausgabe_pfad, bildname)
+                try:
+                    shutil.copy2(src_img, dst_img)
+                except Exception:
+                    continue
+
+                link_html = f"<a href='{link}' target='_blank'>Link</a><br>" if link and link != "-" else ""
+                verzeichnis_pfad = resolve_verzeichnis_path(verzeichnis, zusi_pfad)
+                if verzeichnis_pfad:
+                    verzeichnis_url = 'file:///' + verzeichnis_pfad.replace("\\", "/").replace(" ", "%20")
+                    path_for_clip = verzeichnis_pfad.replace("\\", "/")
+                    link_objekt = (
+                        f"<a href='{verzeichnis_url}' target='_blank'>Zum Objektordner</a><br>"
+                        f"<a href='#' onclick=\"navigator.clipboard.writeText('{path_for_clip}'); return false;\">📋 Pfad kopieren</a>"
+                        f"{warn_html}<br>"
+                    )
+                    anzeige_verzeichnis = verzeichnis_pfad.replace("/", "\\")
+                    anzeige_verzeichnis_html = f"<div style='font-size:10px; color:#555; word-break:break-all;'>{anzeige_verzeichnis}</div>"
+                else:
+                    link_objekt = ("<span title='Dieses Objekt scheint nicht im offiziellen Bestand zu liegen' style='color:gray'>Kein Objektordner</span>"
+                                   f"{warn_html}<br>")
+                    anzeige_verzeichnis_html = ""
+
+                f.write(
+                    f"<div class='item'>"
+                    f"<b>Score: {score:.2f}</b><div class='meta'>{name}</div>"
+                    f"{link_html}{link_objekt}{anzeige_verzeichnis_html}"
+                    f"<img src='{bildname}' class='thumb'>"
+                    f"</div>"
+                )
+            f.write("</div></body></html>")
+
+        if ergebnis_oeffnen_var.get():
+            try:
+                webbrowser.open(f"file:///{html_path}")
+            except Exception:
+                pass
+
+        if ordner_oeffnen_var.get():
+            try:
+                subprocess.Popen(["explorer", os.path.realpath(ausgabe_pfad)])
+            except Exception:
+                pass
+
+        progress_text_var.set(f"Analysiere {eingabe_datei} ({idx}/{len(eingabe_pfade)})...")
+        root.update_idletasks()
+
+        # Fortschritt pro Bild
+        durations.append(time.time() - current_image_start)
+        ergebnisse_counter += 1
+
+    if ergebnis_oeffnen_var.get():
+        try:
+            webbrowser.open(f"file:///{html_path}")
+        except Exception:
+            pass
+
+    fortschritt.set(100)
+    eta_text_var.set("Fertig")
+    progress_text_var.set("Analyse abgeschlossen")
+
+
+# Layout
+frm = tk.Frame(root)
+frm.pack(padx=12, pady=12)
+
+tk.Button(frm, text="Bilder auswählen", command=bilder_auswaehlen).grid(row=0, column=0, sticky="w")
+tk.Label(frm, textvariable=progress_text_var).grid(row=0, column=1, sticky="w", padx=8)
+
+tk.Label(root, text="Modus:").pack(anchor="w", padx=12)
+for label, value in [("Standard", "standard"), ("Strong", "strong")]:
+    tk.Radiobutton(root, text=label, variable=modus_var, value=value).pack(anchor="w", padx=18)
+
+tk.Label(root, text="Zusi-Stammdatenverzeichnis (Ordner _ZusiData wählen):").pack(anchor="w", padx=12, pady=(8, 0))
+tk.Entry(root, textvariable=zusi_pfad_var, width=60).pack(anchor="w", padx=12)
+tk.Button(root, text="Pfad auswählen", command=lambda: zusi_pfad_var.set(filedialog.askdirectory())).pack(anchor="w", padx=12, pady=(4, 8))
+
+tk.Checkbutton(root, text="Ergebnis sofort öffnen", variable=ergebnis_oeffnen_var).pack(anchor="w", padx=12)
+tk.Checkbutton(root, text="Verzeichnis sofort öffnen", variable=ordner_oeffnen_var).pack(anchor="w", padx=12)
+
+tk.Button(root, text="Analyse starten",
+          command=lambda: threading.Thread(target=analyse_ausfuehren, daemon=True).start()).pack(pady=8, padx=12)
+
+ttk.Progressbar(root, maximum=100, variable=fortschritt, length=320, mode="determinate").pack(anchor="w", padx=12)
+tk.Label(root, textvariable=eta_text_var).pack(anchor="w", padx=12, pady=(4, 0))
 
 root.mainloop()
