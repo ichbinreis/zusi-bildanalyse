@@ -38,7 +38,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # CLIP
 model_path = os.path.join(SCRIPT_DIR, "clip_patch", "open_clip_pytorch_model.bin")
-model, _, image_preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained=model_path)
+model, _, image_preprocess = open_clip.create_model_and_transforms("ViT-B-32")
+ckpt = torch.load(model_path, map_location="cpu")
+state = ckpt.get("state_dict") or ckpt.get("model") or ckpt
+model.load_state_dict(state, strict=False)
 model.to(device)
 model.eval()
 
