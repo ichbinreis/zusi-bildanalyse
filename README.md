@@ -28,3 +28,11 @@ Daten/Objektdatenbank.csv
 alle_bilder_embeddings.npy
 alle_bilder_index.csv
 ```
+
+## Changelog
+v1.1
+Reduced from 3 to 2 analysis types (fast and not so fast)
+Now also supports absolute paths (for objects not located in \Routes)
+597 objects marked as unsuitable for "Geländeformer", warning message integrated in evaluation
+ETA fixed, now shows ETA for both the currently analyzed and the total analysis
+Progress bar fixed
