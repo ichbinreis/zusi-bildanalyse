@@ -12,6 +12,8 @@ source venv/bin/activate
 .\venv\Scripts\activate
 
 pip install -r requirements.txt
+
+pip install "rembg[cpu]"
 ```
 
 ## Required files
